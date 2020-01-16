@@ -56,7 +56,7 @@ Example of output from Artemis:
 ```
 {'input file': 'endodontidaeMakatea.pdf', 'approved': True, 
 'reason': 'Could not find any evidence that this PDF is publisher-generated', 
-'title_match_file_metadata': False, 'number_of_publisher_tags_in_file_metadata': 0, 
+'title_match_file_metadata': False, 'extract_publisher_tags_from_file_metadata': 0, 
 'more_than_three_pages': True, 'title_match_extracted_text': False, 
 'doi_match_extracted_text': False, 'cc_match_extracted_text': None, 
 'title_match_cermxml': True, 'image_on_first_page': False, 'detected_logos': []}

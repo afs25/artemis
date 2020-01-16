@@ -1,3 +1,4 @@
+import glob
 import imghdr
 import json
 import logging
@@ -16,8 +17,9 @@ PARENT_FOLDER = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 logging.config.fileConfig(os.path.join(PARENT_FOLDER, 'logging.conf'), defaults={'logfilename': 'logos.log'})
 logger = logging.getLogger(__name__)
 
-SHELVE_DB_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), "logos_db.shelve")
+SHELVE_DB_BASENAME = os.path.join(os.path.dirname(os.path.realpath(__file__)), "logos_shelve_db")
 LOGOS_LIBRARY = os.path.join(PARENT_FOLDER, "publisher_logos")
+
 
 class PublisherLogo:
     def __init__(self, name, width=None, height=None, text=None, publisher=None,
@@ -47,7 +49,7 @@ class PublisherLogo:
             self.calculate_average_hash()
         if not self.perception_hash:
             self.calculate_perception_hash()
-        with shelve.open(SHELVE_DB_PATH) as db:
+        with shelve.open(SHELVE_DB_BASENAME) as db:
             db[self.name] = self
 
     def calculate_image_size(self):
@@ -119,12 +121,20 @@ class PublisherLogo:
         return False
 
 
-def update_logos_db():
+def recreate_logos_db():
+    # delete previous version(s) of database (file extension unknown due to peculiarities of shelve module)
+    shelve_db_files = glob.glob(f'{SHELVE_DB_BASENAME}.*')
+    if shelve_db_files:
+        for f in shelve_db_files:
+            os.remove(f)
+            logger.info(f'Deleted previous logos database {f}')
+
+    # create a new shelve database with all logos in the library
     for filename in os.listdir(LOGOS_LIBRARY):
         file_path = os.path.join(LOGOS_LIBRARY, filename)
         if imghdr.what(file_path):
             json_filename = filename.split('.')[0] + '.json'
-            with open(os.path.join(LOGOS_LIBRARY,json_filename)) as f:
+            with open(os.path.join(LOGOS_LIBRARY, json_filename)) as f:
                 metadata = json.load(f)
             pl = PublisherLogo(filename, path=file_path, **metadata)
             pl.store_in_db()
@@ -132,4 +142,4 @@ def update_logos_db():
 
 
 if __name__ == "__main__":
-    update_logos_db()
+    recreate_logos_db()

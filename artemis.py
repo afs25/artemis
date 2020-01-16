@@ -7,6 +7,7 @@ import argparse
 import chardet
 from difflib import SequenceMatcher
 import docx2txt
+import json
 import logging
 import logging.config
 import math
@@ -30,16 +31,20 @@ from PIL import Image
 import imagehash
 from tempfile import TemporaryDirectory, mkdtemp
 
+from utils.common import get_logger
 from utils.constants import SMUR, AM, P, VOR
 from utils.patterns import DOI_PATTERN, ALL_CC_LICENCES, RIGHTS_RESERVED_PATTERNS, VERSION_PATTERNS
 from utils.logos import PublisherLogo
 
-logging.config.fileConfig('logging.conf', defaults={'logfilename':'artemis.log'})
-logger = logging.getLogger(__name__)
 
-# LOGOS_DB_PATH = os.path.join(os.path.realpath(__file__), "utils", "logos_db.shelve") # for some reason, this doesn't
-# work with line: with shelve.open("utils/logos_db.shelve") as db:
-LOGOS_DB_PATH = "utils/logos_db.shelve"
+# # logging.config.fileConfig('logging.conf', defaults={'logfilename': 'artemis.log'})
+# logger = logging.getLogger(__name__)
+logger = get_logger()
+
+
+# LOGOS_DB_PATH = os.path.join(os.path.realpath(__file__), "utils", "logos_db.shelve_BKUP") # for some reason, this doesn't
+# work with line: with shelve.open("utils/logos_db.shelve_BKUP") as db:
+LOGOS_DB_PATH = "utils/logos_db.shelve_BKUP"
 
 NUMBER_OF_CHARACTERS_IN_ONE_PAGE = 2600
 
@@ -57,6 +62,73 @@ DOI_BASE_URL = "https://doi.org/"
 
 NUMBER_PATTERN = regex.compile("\d+")
 
+
+class ArtemisResult:
+    """
+    Handles the output of Artemis
+    """
+    possible_versions = [SMUR, AM, P, VOR]
+    smur_prob = 194
+    am_prob = 5182
+    p_prob = 32
+    vor_oa_prob = 3286
+    vor_pw_prob = 866
+    test_results = {}
+    # high-level checks and info
+    sanity_check = None  # change to True if paper title is what we expect
+    approve_deposit = False  # change to True only if we are confident deposit can go ahead without moderation
+    reason = None
+    # individual tests
+    long_enough = None
+    title_match_file_metadata = None
+    title_match_extracted_text = None
+    extracted_publisher_tags_in_file_metadata = None
+    valid_doi_in_extracted_text = None
+    cc_match_extracted_text = None
+    valid_doi_in_cermine_xml = None
+    title_match_cermine_xml = None
+    image_on_first_page = None
+    detected_logos = None
+
+    def __init__(self, input_filename):
+        self.input_filename = input_filename
+
+    def append_test_result(self, test_func, result):
+        self.test_results.update({test_func.__name__: result})
+        return result
+
+    def json_response(self):
+        return json.dumps({
+            'input_file': self.input_filename,
+            'approve_deposit': self.approve_deposit,
+            'reason': self.reason,
+            'version_confidence': {
+                'SMUR': self.smur_prob / 100,
+                'AM': self.am_prob / 100,
+                'P': self.p_prob / 100,
+                'VOR': (self.vor_oa_prob + self.vor_pw_prob) / 100,
+                'VOR_oa': self.vor_oa_prob / 100,
+                'VOR_pw': self.vor_pw_prob / 100,
+            },
+            'check_results': {
+              'sanity_check': self.sanity_check,
+            },
+            'test_results': self.test_results,
+        })
+
+    def exclude_versions(self, e_list):
+        """
+        Excludes versions in e_list from self.possible_versions
+        :param e_list: List of versions to exclude
+        :return: filtered self.possible_versions
+        """
+        for v in e_list:
+            if v in self.possible_versions:
+                self.possible_versions.remove(v)
+        return self.possible_versions
+
+
+# region parsers
 class BaseParser:
     """
     Parser with common methods shared by all inheriting classes
@@ -82,10 +154,9 @@ class BaseParser:
         self.metadata = kwargs
 
         self.extracted_text = None
+        self.doi_in_extracted_text = None
         self.number_of_pages = None
         self.file_metadata = None
-        self.possible_versions = [SMUR, AM, P, VOR]
-        self.test_results = {} # dictionary to log the results of individual tests
 
     def extract_text(self, method=None):
         '''
@@ -150,7 +221,8 @@ class BaseParser:
         return None
 
     def find_doi_in_extracted_text(self):
-        return self.find_match_in_extracted_text(query=DOI_PATTERN, escape_char=False, allowed_error_ratio=0)
+        self.doi_in_extracted_text = self.find_match_in_extracted_text(query=DOI_PATTERN, escape_char=False, allowed_error_ratio=0)
+        return self.doi_in_extracted_text
 
     def find_cc_statement_in_extracted_text(self):
         for l in ALL_CC_LICENCES:
@@ -173,17 +245,6 @@ class BaseParser:
 
     def detect_funding(self):
         pass
-
-    def exclude_versions(self, e_list):
-        """
-        Excludes versions in e_list from self.possible_versions
-        :param e_list: List of versions to exclude
-        :return: filtered self.possible_versions
-        """
-        for v in e_list:
-            if v in self.possible_versions:
-                self.possible_versions.remove(v)
-        return self.possible_versions
 
     def test_title_match_in_file_metadata(self, title_key, min_similarity=0.9):
         """
@@ -241,7 +302,7 @@ class BaseParser:
 
     def test_doi_resolves(self, doi=None):
         """
-        Test if DOI resolves; if not DOI given, attempt to use declared DOI in self.metadata
+        Test if DOI resolves; if no DOI given, attempt to use declared DOI in self.metadata
         :param doi: DOI to check
         :return:
         """
@@ -301,34 +362,49 @@ class DocxParser(BaseParser):
         :return: Tuple where: first element is string "success" or "fail" to indicate outcome; second element is
             string containing details
         """
-
-        plausible_versions = ['submitted version', 'accepted version', SMUR, AM]
+        # plausible_versions = ['submitted version', 'accepted version', SMUR, AM]  # use ArtemisResult.possible_versions instead
         approve_deposit = False
         reason = ""
+        r = ArtemisResult(self.file_name)
+        r.exclude_versions([P, VOR])
+        r.smur_prob = 5000
+        r.am_prob = 5000
+        r.p_prob = 0
+        r.vor_oa_prob = 0
+        r.vor_pw_prob = 0
 
         self.extract_file_metadata()
-        title_match_file_metadata = self.test_title_match_in_file_metadata('title')
-        self.test_results["title_match_file_metadata"] = title_match_file_metadata
+        r.title_match_file_metadata = r.append_test_result(
+            self.test_title_match_in_file_metadata,
+            self.test_title_match_in_file_metadata('title'),
+        )
 
         self.extract_text()
-        more_than_three_pages = self.test_length_of_extracted_text()
-        self.test_results["more_than_three_pages"] = more_than_three_pages
+        r.long_enough = r.append_test_result(
+            self.test_length_of_extracted_text,
+            self.test_length_of_extracted_text(),
+        )
 
-        title_match_extracted_text = self.test_title_match_in_extracted_text()
-        self.test_results["title_match_extracted_text"] = title_match_extracted_text
+        r.title_match_extracted_text = r.append_test_result(
+            self.test_title_match_in_extracted_text,
+            self.test_title_match_in_extracted_text(),
+        )
 
-        if more_than_three_pages and (title_match_file_metadata or title_match_extracted_text):
-            if self.dec_version.lower() in plausible_versions:
-                approve_deposit = True
-                reason = "Declared version is plausible"
+        if r.long_enough and (r.title_match_file_metadata or r.title_match_extracted_text):
+            r.sanity_check = True
+            if self.dec_version.lower() in r.possible_versions:
+                r.approve_deposit = True
+                r.reason = "Declared version is plausible"
             else:
-                reason = "This is either a submitted or accepted version, " \
+                r.reason = "This is either a submitted or accepted version, " \
                        "but declared version is {}".format(self.dec_version)
         else:
-            reason = "File {} failed automated checks".format(self.file_name)
+            if r.long_enough:
+                r.reason = "Could not find declared title ({}) in file {}".format(self.dec_ms_title, self.file_name)
+            else:
+                r.reason = "File {} is quite short for a journal article. Please check.".format(self.file_name)
 
-        return {'input file': self.file_name, 'approved': approve_deposit, 'reason': reason,
-                **self.test_results}
+        return r.json_response()
 
 
 class PdfParser(BaseParser):
@@ -466,13 +542,13 @@ class PdfParser(BaseParser):
                 return True
         return False
 
-    def test_file_metadata_contains_publisher_tags(self):
-        detected_publisher_tags = 0
+    def extract_publisher_tags_from_file_metadata(self):
+        detected_publisher_tags = list()
         for tag in PUBLISHER_PDF_METADATA_TAGS:
             if tag in self.file_metadata.keys():
                 logger.debug("Found publisher tag {} in file metadata".format(tag))
                 if self.file_metadata[tag]:
-                    detected_publisher_tags += 1
+                    detected_publisher_tags.append(tag)
                 else:
                     logger.debug("However tag {} in file metadata has no value".format(tag))
         if not detected_publisher_tags:
@@ -505,6 +581,20 @@ class PdfParser(BaseParser):
         logger.debug("Could not find DOI in extracted text")
         return False
 
+    def test_valid_doi_in_extracted_text(self, *args, **kwargs):
+        """
+        Alias for self.test_doi_resolves. Used only to differentiate from test_valid_doi_in_cermine_xml
+        in response object
+        """
+        return self.test_doi_resolves(*args, **kwargs)
+
+    def test_valid_doi_in_cermine_xml(self, *args, **kwargs):
+        """
+        Alias for self.test_doi_resolves. Used only to differentiate from test_valid_doi_in_extracted_text
+        in response object
+        """
+        return self.test_doi_resolves(*args, **kwargs)
+
     def parse(self):
         '''
         Workflow for PDF files
@@ -512,108 +602,149 @@ class PdfParser(BaseParser):
             string containing details
         '''
 
+        # plausible_versions = [
+        #     'submitted version', SMUR,
+        #     'accepted version', AM,
+        #     'proof', P,
+        #     'published version', 'version of record', VOR,
+        # ]  # use ArtemisResult.possible_versions instead
+
         approve_deposit = False
+        reason = ""
+
+        r = ArtemisResult(self.file_name)
+        r.smur_prob = 2500
+        r.am_prob = 2500
+        r.p_prob = 2500
+        r.vor_oa_prob = 1250
+        r.vor_pw_prob = 1250
 
         # self.test_doi_resolves()
 
         # region file metadata tests
         self.extract_file_metadata()
-        title_match_file_metadata = self.test_title_match_in_file_metadata('/Title')
-        self.test_results['title_match_file_metadata'] = title_match_file_metadata
-        file_metadata_contains_publisher_tags = self.test_file_metadata_contains_publisher_tags()
-        self.test_results['number_of_publisher_tags_in_file_metadata'] = file_metadata_contains_publisher_tags
-        if file_metadata_contains_publisher_tags:
-            self.possible_versions.remove(SMUR)
-            self.possible_versions.remove(AM)
+
+        r.title_match_file_metadata = r.append_test_result(
+            self.test_title_match_in_file_metadata,
+            self.test_title_match_in_file_metadata('/Title'),
+        )
+
+        r.extracted_publisher_tags_in_file_metadata = r.append_test_result(
+            self.extract_publisher_tags_from_file_metadata,
+            self.extract_publisher_tags_from_file_metadata(),
+        )
+
+        if r.extracted_publisher_tags_in_file_metadata:
+            r.exclude_versions(['submitted version', SMUR])
+            r.smur_prob = 0
+
+            r.exclude_versions(['accepted version', AM])
+            r.am_prob = 0
         # endregion
 
         # region extracted text tests
         self.extract_text()
-        more_than_three_pages = self.test_length_of_extracted_text()
-        self.test_results['more_than_three_pages'] = more_than_three_pages
-        title_match_extracted_text = self.test_title_match_in_extracted_text()
-        self.test_results['title_match_extracted_text'] = title_match_extracted_text
+        r.long_enough = r.append_test_result(
+            self.test_length_of_extracted_text,
+            self.test_length_of_extracted_text(),
+        )
 
-        doi_in_extracted_text = self.find_doi_in_extracted_text()
-        if doi_in_extracted_text:
-            doi_match = doi_in_extracted_text['match']
-            self.test_doi_resolves(doi=doi_match)
+        r.title_match_extracted_text = r.append_test_result(
+            self.test_title_match_in_extracted_text,
+            self.test_title_match_in_extracted_text(),
+        )
 
-        doi_match_extracted_text = self.test_doi_match()
-        self.test_results['doi_match_extracted_text'] = doi_match_extracted_text
-        cc_match_extracted_text = self.find_cc_statement_in_extracted_text()
-        self.test_results['cc_match_extracted_text'] = cc_match_extracted_text
+        self.find_doi_in_extracted_text()
+        if self.doi_in_extracted_text:
+            doi_match = self.doi_in_extracted_text['match']
+            r.valid_doi_in_extracted_text = r.append_test_result(
+                self.test_valid_doi_in_extracted_text,
+                self.test_valid_doi_in_extracted_text(doi=doi_match),
+            )
+
+        r.cc_match_extracted_text = r.append_test_result(
+            self.find_cc_statement_in_extracted_text,
+            self.find_cc_statement_in_extracted_text(),
+        )
         # endregion
 
         # region cermine tests
         self.cermine_file()
         self.parse_cermxml()
         if self.cerm_doi:
-            logger.debug("Cermine identified DOI {} in this file".format(self.cerm_doi))
-            doi_found_in_cermxml = True
-            self.test_results['doi_found_in_cermxml'] = doi_found_in_cermxml
-        title_match_cermxml = self.test_title_match_cermxml()
-        self.test_results['title_match_cermxml'] = title_match_cermxml
+            r.valid_doi_in_cermine_xml = r.append_test_result(
+                self.test_valid_doi_in_cermine_xml,
+                self.test_valid_doi_in_cermine_xml(doi=self.cerm_doi),
+            )
+
+        r.title_match_cermine_xml = r.append_test_result(
+            self.test_title_match_cermxml,
+            self.test_title_match_cermxml(),
+        )
         # endregion
 
         # region logo tests
-        image_on_first_page = self.test_file_has_image_on_first_page()
-        self.test_results['image_on_first_page'] = image_on_first_page
-        detected_logos = self.detect_publisher_logos()
-        self.test_results['detected_logos'] = detected_logos
+        r.image_on_first_page = r.append_test_result(
+            self.test_file_has_image_on_first_page,
+            self.test_file_has_image_on_first_page(),
+        )
 
-        # exclude self.possible_versions that are not corroborated by detected logos
-        if detected_logos:
-            logger.debug("self.possible_versions before considering logos: {}".format(self.possible_versions))
+        r.detected_logos = r.append_test_result(
+            self.detect_publisher_logos,
+            self.detect_publisher_logos(),
+        )
+
+        # exclude r.possible_versions that are not corroborated by detected logos
+        if r.detected_logos:
+            logger.debug("r.possible_versions before considering logos: {}".format(r.possible_versions))
             suggested_versions = []
-            for dl in detected_logos:
+            for dl in r.detected_logos:
                 for version in dl.metadata["indicate_ms_versions"]:
                     if version not in suggested_versions:
                         suggested_versions.append(version)
             logger.debug("Versions suggested by logos: {}".format(suggested_versions))
-            for v in reversed(self.possible_versions): # https://stackoverflow.com/a/14283447
+            for v in reversed(r.possible_versions): # https://stackoverflow.com/a/14283447
                 if v not in suggested_versions:
-                    self.possible_versions.remove(v)
-            logger.debug("self.possible_versions after considering logos: {}".format(self.possible_versions))
-
-
-
-
-
+                    r.exclude_versions([v])
+            logger.debug("r.possible_versions after considering logos: {}".format(r.possible_versions))
         # endregion
 
-        if more_than_three_pages and (title_match_file_metadata or title_match_extracted_text or title_match_cermxml):
-            # sanity check (this is the correct file; no mistake on upload)
-            if file_metadata_contains_publisher_tags or cc_match_extracted_text:
+        # region decision
+        if r.long_enough and (r.title_match_file_metadata or r.title_match_extracted_text):
+            r.sanity_check = True
+
+            if r.extracted_publisher_tags_in_file_metadata or r.cc_match_extracted_text:
                 # file is publisher-generated
                 # TODO: Add more tests here
-                self.exclude_versions([SMUR, AM])
+                r.exclude_versions([SMUR, AM])
                 if self.dec_version.lower() in ['submitted version', 'accepted version', SMUR, AM]:
-                    reason = 'PDF metadata contains publisher tags, but declared version is author-generated'
-                if cc_match_extracted_text:
-                    reason = 'Create Commons licence detected in extracted text'
-                    approve_deposit = True # could be proof, so additional checking is desirable
+                    r.reason = 'PDF metadata contains publisher tags, but declared version is author-generated'
+                if r.cc_match_extracted_text:
+                    r.reason = 'Create Commons licence detected in extracted text'
+                    r.approve_deposit = True  # could be proof, so additional checking is desirable
                 else:
-                    reason = 'Publisher-generated version; no evidence of CC licence'
+                    r.reason = 'Publisher-generated version; no evidence of CC licence'
             else:
                 if self.dec_version.lower() in ['submitted version', 'accepted version', SMUR, AM]:
-                    approve_deposit = True
-                    reason = 'Could not find any evidence that this PDF is publisher-generated'
+                    r.approve_deposit = True
+                    r.reason = 'Could not find any evidence that this PDF is publisher-generated'
                 else:
-                    reason = "This is either a submitted or accepted version, " \
-                                   "but declared version is {}".format(self.dec_version)
+                    r.reason = "This is either a submitted or accepted version, " \
+                             "but declared version is {}".format(self.dec_version)
         else:
-            reason = "File {} failed automated checks. more_than_three_pages: {}, title_match_file_metadata:" \
-                           " {}, title_match_extracted_text: {}".format(self.file_name,
-                                                                        more_than_three_pages,
-                                                                        title_match_file_metadata,
-                                                                        title_match_extracted_text)
-        return {'input file': self.file_name, 'approved': approve_deposit, 'reason': reason, **self.test_results}
+            if r.long_enough:
+                r.reason = "Could not find declared title ({}) in file {}".format(self.dec_ms_title, self.file_name)
+            else:
+                r.reason = "File {} is quite short for a journal article. Please check.".format(self.file_name)
+        # endregion
+
+        return r.json_response()
+# endregion
 
 
 class VersionDetector:
     def __init__(self, file_path, keep_temp_files=False,
-                 dec_ms_title=None, dec_version=None, dec_authors=None, **kwargs):
+                 dec_ms_title=None, dec_version=None, dec_authors=None, working_folder=None, **kwargs):
         '''
 
         :param file_path: Path to file this class will evaluate
@@ -631,6 +762,7 @@ class VersionDetector:
         self.dec_ms_title = dec_ms_title
         self.dec_version = dec_version
         self.dec_authors = dec_authors
+        self.working_folder = working_folder
         self.metadata = kwargs
         logger.info("----- Working on file {}".format(file_path))
 
@@ -656,20 +788,24 @@ class VersionDetector:
             p = DocxParser(self.file_path, self.dec_ms_title, self.dec_version, self.dec_authors, **self.metadata)
             result = p.parse()
         elif ext == "pdf":
-            def pdf_routine(detector_instance, temp_file):
-                shutil.copy2(detector_instance.file_path, temp_file)
-                pdfparser = PdfParser(temp_file, detector_instance.dec_ms_title,
+            def pdf_routine(detector_instance, target_file):
+                shutil.copy2(detector_instance.file_path, target_file)
+                pdfparser = PdfParser(target_file, detector_instance.dec_ms_title,
                                       detector_instance.dec_version, detector_instance.dec_authors,
                                       **detector_instance.metadata)
                 return pdfparser.parse()
-            if not self.keep_temp_files:
+
+            if self.working_folder:
+                target = os.path.join(self.working_folder, self.file_name)
+                result = pdf_routine(self, target)
+            elif not self.keep_temp_files:
                 with TemporaryDirectory(prefix="artemis-") as tmpdir:
-                    tmpfile = os.path.join(tmpdir, self.file_name)
-                    result = pdf_routine(self, tmpfile)
+                    target = os.path.join(tmpdir, self.file_name)
+                    result = pdf_routine(self, target)
             else:
                 tmpdir = mkdtemp(prefix="artemis-")
-                tmpfile = os.path.join(tmpdir, self.file_name)
-                result = pdf_routine(self, tmpfile)
+                target = os.path.join(tmpdir, self.file_name)
+                result = pdf_routine(self, target)
 
         else:
             error_msg = "{} is not a supported file extension".format(ext)
@@ -707,10 +843,18 @@ https://opensource.org/licenses/MIT
     parser.add_argument('-v', '--version', dest='version', type=str,
                         metavar='"{}", "{}", "{}" or "{}"'.format(SMUR, AM, P, VOR),
                         help='Expected/declared version of journal article')
+    parser.add_argument('-w', '--working-folder', dest='working-folder', type=str,
+                        metavar='<path>',
+                        help='Path to working folder to be used (instead of temp folder)')
     arguments = parser.parse_args()
 
-    detector = VersionDetector(arguments.path, keep_temp_files=arguments.keep,
-                               dec_ms_title=arguments.title, dec_version=arguments.version)
+    detector = VersionDetector(
+        arguments.path,
+        keep_temp_files=arguments.keep,
+        dec_ms_title=arguments.title,
+        dec_version=arguments.version,
+        working_folder=arguments.working-folder,
+    )
     print(detector.detect())
 
     # TODO: This project has some useful functions: https://github.com/Phyks/libbmc/blob/master/libbmc/doi.py
